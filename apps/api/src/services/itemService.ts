@@ -148,6 +148,7 @@ export async function getItemDetail(userId: string, ctx: FamilyContext, itemId: 
       body: n.body,
       status: n.status,
       rejectReason: n.rejectReason,
+      baseVersion: n.baseVersion,
       createdAt: n.createdAt.toISOString(),
       decidedAt: n.decidedAt?.toISOString() ?? null,
       author: n.author,
@@ -274,6 +275,34 @@ export function toVersionSnapshot(item: Item): Prisma.InputJsonValue {
   } as unknown as Prisma.InputJsonValue;
 }
 
+/**
+ * 串行化同一条目的正文修改：采纳补充 / 编辑 / 回滚都必须先在事务里拿这把行锁，
+ * 再读正文、算版本号，否则并发下会互相覆盖已写入的内容或撞版本号唯一约束。
+ */
+export async function lockItemForUpdate(tx: Prisma.TransactionClient, itemId: string): Promise<void> {
+  await tx.$queryRaw`SELECT id FROM items WHERE id = ${itemId} FOR UPDATE`;
+}
+
+/** 追加一个版本。调用前必须已持有 lockItemForUpdate 的行锁；返回新版本号。 */
+export async function appendItemVersion(
+  tx: Prisma.TransactionClient,
+  itemId: string,
+  snapshot: Prisma.InputJsonValue,
+  createdBy: string,
+  noteId?: string,
+): Promise<number> {
+  const last = await tx.itemVersion.findFirst({
+    where: { itemId },
+    orderBy: { version: 'desc' },
+    select: { version: true },
+  });
+  const version = (last?.version ?? 0) + 1;
+  await tx.itemVersion.create({
+    data: { itemId, version, snapshot, createdBy, noteId: noteId ?? null },
+  });
+  return version;
+}
+
 export async function updateItem(
   userId: string,
   ctx: FamilyContext,
@@ -298,6 +327,7 @@ export async function updateItem(
       : computeSortAt({ acquiredAt: nextAcquiredAt, acquiredPrecision: nextPrecision }, new Date());
 
   return prisma.$transaction(async (tx) => {
+    await lockItemForUpdate(tx, itemId);
     const updated = await tx.item.update({
       where: { id: itemId },
       data: {
@@ -340,15 +370,7 @@ export async function updateItem(
       }
     }
 
-    const last = await tx.itemVersion.findFirst({ where: { itemId }, orderBy: { version: 'desc' } });
-    await tx.itemVersion.create({
-      data: {
-        itemId,
-        version: (last?.version ?? 0) + 1,
-        snapshot: toVersionSnapshot(updated),
-        createdBy: userId,
-      },
-    });
+    await appendItemVersion(tx, itemId, toVersionSnapshot(updated), userId);
     await audit.record(
       {
         familyId: ctx.familyId,
@@ -469,6 +491,7 @@ export async function listVersions(ctx: FamilyContext, itemId: string) {
   return versions.map((v) => ({
     id: v.id,
     version: v.version,
+    noteId: v.noteId,
     createdAt: v.createdAt.toISOString(),
     createdBy: v.createdBy,
     snapshot: v.snapshot,
@@ -491,6 +514,7 @@ export async function revertVersion(
   const story = cleanStory(typeof snap.storyHtml === 'string' ? snap.storyHtml : null);
 
   return prisma.$transaction(async (tx) => {
+    await lockItemForUpdate(tx, itemId);
     const updated = await tx.item.update({
       where: { id: itemId },
       data: {
@@ -520,15 +544,7 @@ export async function revertVersion(
       },
       include: LIST_INCLUDE,
     });
-    const last = await tx.itemVersion.findFirst({ where: { itemId }, orderBy: { version: 'desc' } });
-    await tx.itemVersion.create({
-      data: {
-        itemId,
-        version: (last?.version ?? 0) + 1,
-        snapshot: toVersionSnapshot(updated),
-        createdBy: userId,
-      },
-    });
+    await appendItemVersion(tx, itemId, toVersionSnapshot(updated), userId);
     await audit.record(
       {
         familyId: ctx.familyId,

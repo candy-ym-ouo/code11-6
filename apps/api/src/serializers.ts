@@ -116,7 +116,7 @@ export function toPersonDto(p: Person & { _count?: { links: number } }) {
   };
 }
 
-export function toNoteDto(n: ItemNote & { author?: Pick<User, 'id' | 'displayName' | 'avatarColor'> }) {
+export function toNoteDto(n: ItemNote & { author?: Pick<User, 'id' | 'displayName' | 'avatarColor'> | null }) {
   return {
     id: n.id,
     itemId: n.itemId,
@@ -124,6 +124,7 @@ export function toNoteDto(n: ItemNote & { author?: Pick<User, 'id' | 'displayNam
     body: n.body,
     status: n.status,
     rejectReason: n.rejectReason,
+    baseVersion: n.baseVersion,
     createdAt: n.createdAt.toISOString(),
     decidedAt: n.decidedAt?.toISOString() ?? null,
     author: n.author

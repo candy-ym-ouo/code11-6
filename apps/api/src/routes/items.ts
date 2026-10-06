@@ -154,8 +154,9 @@ itemsRouter.post(
   asyncHandler(async (req, res) => {
     const user = currentUser(req);
     const ctx = familyCtx(req);
-    const note = await noteService.createNote(user.id, ctx, req.params.itemId!, req.body, clientMeta(req));
-    res.status(201).json({ note });
+    const result = await noteService.createNote(user.id, ctx, req.params.itemId!, req.body, clientMeta(req));
+    // 同一家人重复提交相同内容时幂等返回 200，不重复建档
+    res.status(result.created ? 201 : 200).json(result);
   }),
 );
 
@@ -166,8 +167,13 @@ itemsRouter.post(
   asyncHandler(async (req, res) => {
     const user = currentUser(req);
     const ctx = familyCtx(req);
-    const note = await noteService.acceptNote(user.id, ctx, req.params.itemId!, req.params.noteId!, clientMeta(req));
-    res.json({ note, item: await itemService.getItemDetail(user.id, ctx, req.params.itemId!) });
+    const result = await noteService.acceptNote(user.id, ctx, req.params.itemId!, req.params.noteId!, clientMeta(req));
+    res.json({
+      note: result.note,
+      version: result.version,
+      stale: result.stale,
+      item: await itemService.getItemDetail(user.id, ctx, req.params.itemId!),
+    });
   }),
 );
 

@@ -4,7 +4,7 @@ import { api, ApiError } from '../../api/client';
 import { Avatar, Button, TextArea, Tag } from '../../components/ui';
 import { useToast } from '../../components/Toast';
 import { relativeTime } from '../../lib/format';
-import type { ItemDetail, Note } from '../../api/types';
+import type { AcceptNoteResult, CreateNoteResult, ItemDetail, Note } from '../../api/types';
 import { useAuth } from '../auth/AuthContext';
 
 const TYPE_LABELS: Record<Note['type'], string> = {
@@ -26,19 +26,32 @@ export function StoryThread({ fid, item }: { fid: string; item: ItemDetail }) {
   };
 
   const create = useMutation({
-    mutationFn: () => api.post(`/families/${fid}/items/${item.id}/notes`, { type, body: body.trim() }),
-    onSuccess: async () => {
+    mutationFn: () => api.post<CreateNoteResult>(`/families/${fid}/items/${item.id}/notes`, { type, body: body.trim() }),
+    onSuccess: async (data) => {
       setBody('');
-      push('已经记下来了，等家人确认后会并入正文', 'success');
+      if (!data.created) {
+        push('相同内容你之前已经提交过了，没有重复记录', 'info');
+      } else if (data.possibleDuplicates.length > 0) {
+        const names = data.possibleDuplicates.map((d) => d.authorName).join('、');
+        push(`已经记下来了；注意与 ${names} 待确认的补充内容相近，确认时可以对照一下`, 'info');
+      } else {
+        push('已经记下来了，等家人确认后会并入正文', 'success');
+      }
       await invalidate();
     },
     onError: (err) => setError(err instanceof ApiError ? err.message : '提交失败'),
   });
 
   const accept = useMutation({
-    mutationFn: (noteId: string) => api.post(`/families/${fid}/items/${item.id}/notes/${noteId}/accept`),
-    onSuccess: async () => {
-      push('已采纳并并入正文', 'success');
+    mutationFn: (noteId: string) =>
+      api.post<AcceptNoteResult>(`/families/${fid}/items/${item.id}/notes/${noteId}/accept`),
+    onSuccess: async (data) => {
+      push(
+        data.stale
+          ? `已采纳为第 ${data.version} 版；注意：这条补充是基于旧版正文写的，请核对上下文`
+          : `已采纳并并入正文（第 ${data.version} 版）`,
+        data.stale ? 'info' : 'success',
+      );
       await invalidate();
       await queryClient.invalidateQueries({ queryKey: ['items', fid] });
     },
@@ -87,6 +100,9 @@ export function StoryThread({ fid, item }: { fid: string; item: ItemDetail }) {
                   <strong>{note.author?.displayName ?? '家人'}</strong>
                   <Tag>{TYPE_LABELS[note.type]}</Tag>
                   {note.status === 'accepted' ? <Tag tone="success">已并入正文</Tag> : <Tag tone="warn">待确认</Tag>}
+                  {note.status === 'pending' && note.baseVersion > 0 && note.baseVersion < item.versionCount ? (
+                    <Tag tone="muted">基于旧版正文</Tag>
+                  ) : null}
                   <span className="log-item__meta">{relativeTime(note.createdAt)}</span>
                 </div>
                 <p style={{ margin: '6px 0 0', whiteSpace: 'pre-wrap' }}>{note.body}</p>

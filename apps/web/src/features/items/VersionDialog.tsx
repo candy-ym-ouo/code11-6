@@ -1,12 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError } from '../../api/client';
-import { Button, Modal, Spinner } from '../../components/ui';
+import { Button, Modal, Spinner, Tag } from '../../components/ui';
 import { useToast } from '../../components/Toast';
 import { formatDateTime } from '../../lib/format';
 
 interface Version {
   id: string;
   version: number;
+  noteId: string | null;
   createdAt: string;
   snapshot: { title?: string; storyHtml?: string | null };
 }
@@ -51,7 +52,8 @@ export function VersionDialog({
           {(versions.data?.versions ?? []).map((v) => (
             <div key={v.id} className="log-item">
               <div className="log-item__body">
-                <strong>第 {v.version} 版</strong>
+                <strong>第 {v.version} 版</strong>{' '}
+                {v.noteId ? <Tag tone="muted">家人补充并入</Tag> : null}
                 <div className="log-item__meta">{formatDateTime(v.createdAt)}</div>
                 <div className="muted" style={{ fontSize: 13 }}>
                   {v.snapshot.title}

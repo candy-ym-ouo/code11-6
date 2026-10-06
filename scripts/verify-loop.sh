@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 端到端闭环验证：用真实 HTTP 请求走完
-# 注册 → 建家庭 → 建人物 → 建档 → 上传图片/音频 → 发布 → 补充故事 → 邀请成员 →
-# 权限边界 → 私密条目隔离 → 导出 ZIP → 审计留痕 → 回收站。
+# 注册 → 建家庭 → 建人物 → 建档 → 上传图片/音频 → 发布 → 补充故事（重复检测/并发采纳/决策留痕）→
+# 邀请成员 → 权限边界 → 私密条目隔离 → 导出 ZIP → 审计留痕 → 回收站。
 #
 # 用法：API=http://127.0.0.1:4000 bash scripts/verify-loop.sh
 set -euo pipefail
@@ -196,6 +196,78 @@ if json 'd.item.storyHtml' < "$WORK/body" | grep -q "刻的印子"; then ok "正
 code=$(req GET "$V1/families/$FID/items/$IID/versions" "$JAR_A" "" "$TOKEN_A")
 VER_COUNT=$(json 'd.versions.length' < "$WORK/body")
 if [ "$VER_COUNT" -ge 2 ]; then ok "版本历史已记录（$VER_COUNT 个版本）"; else bad "版本历史异常：$VER_COUNT"; fi
+
+# —— 家人补充：重复检测 / 并发采纳 / 决策留痕 ——
+
+# 已并入正文的内容再次提交 → 409
+code=$(req POST "$V1/families/$FID/items/$IID/notes" "$JAR_A" '{"type":"story","body":"箱子是我 10 岁那年跟着搬的，木头上还有我刻的印子。"}' "$TOKEN_A")
+expect "$code" 409 "已并入正文的内容再次提交被拒"
+
+# 同一家人重复提交相同内容 → 幂等返回同一条，不产生重复记录
+code=$(req POST "$V1/families/$FID/items/$IID/notes" "$JAR_A" '{"type":"story","body":"箱子的铜锁是后来配的，原来那把早就丢了。"}' "$TOKEN_A")
+expect "$code" 201 "第二条补充提交成功"
+NID_A=$(json 'd.note.id' < "$WORK/body")
+code=$(req POST "$V1/families/$FID/items/$IID/notes" "$JAR_A" '{"type":"story","body":"箱子的铜锁是后来配的，原来那把早就丢了。"}' "$TOKEN_A")
+expect "$code" 200 "同一家人重复提交相同内容幂等返回"
+NID_DUP=$(json 'd.note.id' < "$WORK/body")
+if [ "$NID_DUP" = "$NID_A" ]; then ok "幂等返回同一条补充，不产生重复记录"; else bad "重复提交产生了新记录"; fi
+
+# 并发请求辅助：各自写独立响应文件，避免互相覆盖
+race_post() { # race_post <名字> <url>
+  curl -sS -o "$WORK/$1.body" -w '%{http_code}' -X POST -b "$JAR_A" -c "$JAR_A" \
+    -H "Authorization: Bearer $TOKEN_A" "$2" > "$WORK/$1.code" &
+}
+
+# 两位家人同时被采纳（并发）：都成功、正文都包含、各生成一个版本
+code=$(req POST "$V1/families/$FID/items/$IID/notes" "$JAR_A" '{"type":"story","body":"搬家那年我在箱盖上刻过自己的乳名。"}' "$TOKEN_A")
+expect "$code" 201 "第三条补充提交成功"
+NID_B=$(json 'd.note.id' < "$WORK/body")
+code=$(req GET "$V1/families/$FID/items/$IID/versions" "$JAR_A" "" "$TOKEN_A")
+VER_BEFORE=$(json 'd.versions.length' < "$WORK/body")
+
+race_post accA "$V1/families/$FID/items/$IID/notes/$NID_A/accept"
+race_post accB "$V1/families/$FID/items/$IID/notes/$NID_B/accept"
+wait
+CODE_A=$(cat "$WORK/accA.code"); CODE_B=$(cat "$WORK/accB.code")
+if [ "$CODE_A" = "200" ] && [ "$CODE_B" = "200" ]; then ok "两条补充并发采纳都成功"; else bad "并发采纳异常（$CODE_A/$CODE_B）"; fi
+STALE_A=$(json 'd.stale' < "$WORK/accA.body"); STALE_B=$(json 'd.stale' < "$WORK/accB.body")
+if [ "$STALE_A" = "true" ] || [ "$STALE_B" = "true" ]; then ok "基于旧版正文的补充被标记（冲突检测）"; else bad "未检出基于旧版正文的冲突"; fi
+
+code=$(req GET "$V1/families/$FID/items/$IID" "$JAR_A" "" "$TOKEN_A")
+if json 'd.item.storyHtml' < "$WORK/body" | grep -q "铜锁" && json 'd.item.storyHtml' < "$WORK/body" | grep -q "乳名"; then
+  ok "并发采纳的两条补充都并入正文，未互相覆盖"
+else
+  bad "并发采纳丢失了已采纳内容"
+fi
+code=$(req GET "$V1/families/$FID/items/$IID/versions" "$JAR_A" "" "$TOKEN_A")
+VER_AFTER=$(json 'd.versions.length' < "$WORK/body")
+if [ "$VER_AFTER" -eq "$((VER_BEFORE + 2))" ]; then ok "每次采纳各生成一个版本（$VER_BEFORE → $VER_AFTER）"; else bad "版本数异常：$VER_BEFORE → $VER_AFTER"; fi
+
+# 同一条补充被并发采纳：只有一次生效，内容不重复并入
+code=$(req POST "$V1/families/$FID/items/$IID/notes" "$JAR_A" '{"type":"comment","body":"这条用来验证同一条补充不会被采纳两次。"}' "$TOKEN_A")
+expect "$code" 201 "第四条补充提交成功"
+NID_C=$(json 'd.note.id' < "$WORK/body")
+race_post accC1 "$V1/families/$FID/items/$IID/notes/$NID_C/accept"
+race_post accC2 "$V1/families/$FID/items/$IID/notes/$NID_C/accept"
+wait
+C1=$(cat "$WORK/accC1.code"); C2=$(cat "$WORK/accC2.code")
+if { [ "$C1" = "200" ] && [ "$C2" = "409" ]; } || { [ "$C1" = "409" ] && [ "$C2" = "200" ]; }; then
+  ok "同一条补充并发采纳只有一次生效（$C1/$C2）"
+else
+  bad "同一条补充并发采纳应为 200+409，实际 $C1/$C2"
+fi
+code=$(req GET "$V1/families/$FID/items/$IID" "$JAR_A" "" "$TOKEN_A")
+OCCUR=$(json 'd.item.storyHtml' < "$WORK/body" | grep -o "不会被采纳两次" | wc -l)
+if [ "$OCCUR" = "1" ]; then ok "同一补充只并入正文一次"; else bad "同一补充并入正文 $OCCUR 次"; fi
+
+# 决策留痕：审计里的采纳记录带有生成的版本号
+code=$(req GET "$V1/families/$FID/audit-logs?action=note.accept&limit=20" "$JAR_A" "" "$TOKEN_A")
+expect "$code" 200 "按动作筛选审计日志"
+if [ "$(json 'd.logs.some(l=>l.diff&&typeof l.diff.version==="number")' < "$WORK/body")" = "true" ]; then
+  ok "采纳决策已留痕（含生成版本号）"
+else
+  bad "审计日志缺少采纳决策记录"
+fi
 
 # ---------- 7. 邀请家人 + 权限边界 ----------
 step "7/10 邀请家人与权限边界"

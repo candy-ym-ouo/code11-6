@@ -107,9 +107,27 @@ export interface Note {
   body: string;
   status: 'pending' | 'accepted' | 'rejected';
   rejectReason: string | null;
+  /** 提交这条补充时条目的版本号；小于当前版本数说明正文此后又变过（0 表示旧数据未知） */
+  baseVersion: number;
   createdAt: string;
   decidedAt: string | null;
   author: { id: string; displayName: string; avatarColor: string } | null;
+}
+
+export interface CreateNoteResult {
+  note: Note;
+  /** false 表示重复提交相同内容，幂等返回了之前那条 */
+  created: boolean;
+  possibleDuplicates: { id: string; authorName: string; excerpt: string }[];
+}
+
+export interface AcceptNoteResult {
+  note: Note;
+  /** 本次采纳生成的版本号 */
+  version: number;
+  /** 该补充是否基于旧版正文（写完后正文又变过） */
+  stale: boolean;
+  item: ItemDetail;
 }
 
 export interface Person {
