@@ -1,15 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError } from '../../api/client';
-import { Button, Modal, Spinner } from '../../components/ui';
+import { Button, Modal, Spinner, Tag } from '../../components/ui';
 import { useToast } from '../../components/Toast';
 import { formatDateTime } from '../../lib/format';
+import type { ItemVersion } from '../../api/types';
 
-interface Version {
-  id: string;
-  version: number;
-  createdAt: string;
-  snapshot: { title?: string; storyHtml?: string | null };
-}
+const SOURCE_LABELS: Record<ItemVersion['source'], string> = {
+  create: '建档',
+  edit: '编辑',
+  note: '采纳家人补充',
+  revert: '回滚',
+};
 
 export function VersionDialog({
   open,
@@ -27,7 +28,7 @@ export function VersionDialog({
 
   const versions = useQuery({
     queryKey: ['versions', fid, itemId],
-    queryFn: () => api.get<{ versions: Version[] }>(`/families/${fid}/items/${itemId}/versions`),
+    queryFn: () => api.get<{ versions: ItemVersion[] }>(`/families/${fid}/items/${itemId}/versions`),
     enabled: open,
   });
 
@@ -51,10 +52,13 @@ export function VersionDialog({
           {(versions.data?.versions ?? []).map((v) => (
             <div key={v.id} className="log-item">
               <div className="log-item__body">
-                <strong>第 {v.version} 版</strong>
+                <div className="row" style={{ gap: 'var(--space-2)' }}>
+                  <strong>第 {v.version} 版</strong>
+                  {v.source === 'note' ? <Tag tone="success">{SOURCE_LABELS[v.source]}</Tag> : <Tag tone="muted">{SOURCE_LABELS[v.source]}</Tag>}
+                </div>
                 <div className="log-item__meta">{formatDateTime(v.createdAt)}</div>
                 <div className="muted" style={{ fontSize: 13 }}>
-                  {v.snapshot.title}
+                  {String(v.snapshot.title ?? '')}
                 </div>
               </div>
               <Button size="sm" onClick={() => revert.mutate(v.id)} loading={revert.isPending}>

@@ -25,7 +25,7 @@ ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; PASS=$((PASS + 1)); }
 bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
-json() { node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));const v=$1;process.stdout.write(v===undefined?'':String(v))"; }
+json() { node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));const v=$1;process.stdout.write(v===undefined?'':String(v));process.exit(0)"; }
 
 # 发请求并把响应体写入 $WORK/body，返回 HTTP 状态码
 req() {
@@ -192,10 +192,31 @@ NID=$(json 'd.note.id' < "$WORK/body")
 code=$(req POST "$V1/families/$FID/items/$IID/notes/$NID/accept" "$JAR_A" "" "$TOKEN_A")
 expect "$code" 200 "采纳补充故事并并入正文"
 if json 'd.item.storyHtml' < "$WORK/body" | grep -q "刻的印子"; then ok "正文已包含采纳的内容"; else bad "正文未包含采纳内容"; fi
+ACCEPTED_VERSION=$(json 'd.version.version' < "$WORK/body")
+if [ -n "$ACCEPTED_VERSION" ]; then ok "采纳时生成了新版本（第 $ACCEPTED_VERSION 版）"; else bad "采纳响应缺少版本信息"; fi
+
+# 重复/冲突检测：完全重复、仅标点空白差异、与正文重复都应被挡；短回复放行
+code=$(req POST "$V1/families/$FID/items/$IID/notes" "$JAR_A" '{"type":"story","body":"箱子是我 10 岁那年跟着搬的，木头上还有我刻的印子。"}' "$TOKEN_A")
+expect "$code" 409 "重复提交（标点空白差异）被归一化查重拒绝"
+DUP_REASON=$(json 'd.error.details.reason' < "$WORK/body")
+if [ "$DUP_REASON" = "duplicate_note" ]; then ok "冲突原因标注为 duplicate_note"; else bad "冲突原因异常：$DUP_REASON"; fi
+code=$(req POST "$V1/families/$FID/items/$IID/notes" "$JAR_A" '{"type":"comment","body":"是的"}' "$TOKEN_A")
+expect "$code" 201 "短回复「是的」不被误判为重复"
+code=$(req POST "$V1/families/$FID/items/$IID/notes/$NID/accept" "$JAR_A" "" "$TOKEN_A")
+expect "$code" 409 "同一条补充不能被重复采纳"
+
+# 决策记录：已采纳补充保留采纳人与版本号，且不允许删除
+code=$(req GET "$V1/families/$FID/items/$IID" "$JAR_A" "" "$TOKEN_A")
+NOTE_VER=$(json 'd.item.notes.find(n=>n.id==="'"$NID"'")?.versionNumber' < "$WORK/body")
+if [ -n "$NOTE_VER" ]; then ok "决策记录保留了对应版本号（第 $NOTE_VER 版）"; else bad "决策记录缺少版本号"; fi
+code=$(req DELETE "$V1/families/$FID/items/$IID/notes/$NID" "$JAR_A" "" "$TOKEN_A")
+expect "$code" 409 "已采纳并入正文的补充不能删除"
 
 code=$(req GET "$V1/families/$FID/items/$IID/versions" "$JAR_A" "" "$TOKEN_A")
 VER_COUNT=$(json 'd.versions.length' < "$WORK/body")
 if [ "$VER_COUNT" -ge 2 ]; then ok "版本历史已记录（$VER_COUNT 个版本）"; else bad "版本历史异常：$VER_COUNT"; fi
+NOTE_SOURCE_N=$(json 'd.versions.filter(v=>v.source==="note").length' < "$WORK/body")
+if [ "$NOTE_SOURCE_N" -ge 1 ]; then ok "采纳产生的版本标注了来源 note"; else bad "版本缺少采纳来源标注"; fi
 
 # ---------- 7. 邀请家人 + 权限边界 ----------
 step "7/10 邀请家人与权限边界"
@@ -243,8 +264,8 @@ PERSON_HITS=$(json 'd.items.length' < "$WORK/body")
 if [ "$PERSON_HITS" = "1" ]; then ok "按来源人物反查命中 1 条"; else bad "来源人物反查异常：$PERSON_HITS"; fi
 
 code=$(req GET "$V1/families/$FID/timeline" "$JAR_A" "" "$TOKEN_A"); expect "$code" 200 "时间轴分组"
-GROUPS=$(json 'd.groups.length' < "$WORK/body")
-if [ "$GROUPS" -ge 1 ]; then ok "时间轴返回 $GROUPS 个时段分组"; else bad "时间轴无分组"; fi
+GROUP_N=$(json 'd.groups.length' < "$WORK/body")
+if [ "$GROUP_N" -ge 1 ]; then ok "时间轴返回 $GROUP_N 个时段分组"; else bad "时间轴无分组"; fi
 
 code=$(req GET "$V1/families/$FID/stats" "$JAR_A" "" "$TOKEN_A"); expect "$code" 200 "家庭统计"
 

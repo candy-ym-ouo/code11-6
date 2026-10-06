@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { findNoteDuplicate, noteAlreadyInStory } from '@heirloom/shared';
 import { api, ApiError } from '../../api/client';
 import { Avatar, Button, TextArea, Tag } from '../../components/ui';
 import { useToast } from '../../components/Toast';
@@ -13,6 +14,14 @@ const TYPE_LABELS: Record<Note['type'], string> = {
   correction: '更正信息',
 };
 
+/** 后端在 409 里给出的重复/冲突原因（见 noteService）。 */
+function conflictReason(err: unknown): string | null {
+  if (err instanceof ApiError && err.code === 'CONFLICT') {
+    return (err as ApiError & { details?: { reason?: string } }).details?.reason ?? 'conflict';
+  }
+  return null;
+}
+
 export function StoryThread({ fid, item }: { fid: string; item: ItemDetail }) {
   const { user } = useAuth();
   const queryClient = useQueryClient();
@@ -20,6 +29,17 @@ export function StoryThread({ fid, item }: { fid: string; item: ItemDetail }) {
   const [body, setBody] = useState('');
   const [type, setType] = useState<Note['type']>('story');
   const [error, setError] = useState<string | null>(null);
+
+  const visibleNotes = item.notes.filter((n) => n.status !== 'rejected');
+
+  // 提交前在本地先做一次归一化查重，长辈重复点「提交」时不用等服务器拒绝
+  const localDup = body.trim()
+    ? findNoteDuplicate(
+        body,
+        visibleNotes.map((n) => ({ body: n.body })),
+      )
+    : null;
+  const inStory = body.trim() ? noteAlreadyInStory(body, item.storyText) : false;
 
   const invalidate = async () => {
     await queryClient.invalidateQueries({ queryKey: ['item', fid, item.id] });
@@ -32,17 +52,33 @@ export function StoryThread({ fid, item }: { fid: string; item: ItemDetail }) {
       push('已经记下来了，等家人确认后会并入正文', 'success');
       await invalidate();
     },
-    onError: (err) => setError(err instanceof ApiError ? err.message : '提交失败'),
+    onError: (err) => {
+      const reason = conflictReason(err);
+      if (reason === 'duplicate_note' || reason === 'already_in_story') {
+        setError(err instanceof ApiError ? err.message : '内容重复');
+      } else {
+        setError(err instanceof ApiError ? err.message : '提交失败');
+      }
+    },
   });
 
   const accept = useMutation({
     mutationFn: (noteId: string) => api.post(`/families/${fid}/items/${item.id}/notes/${noteId}/accept`),
     onSuccess: async () => {
-      push('已采纳并并入正文', 'success');
+      push('已采纳并生成新版本', 'success');
       await invalidate();
+      await queryClient.invalidateQueries({ queryKey: ['versions', fid, item.id] });
       await queryClient.invalidateQueries({ queryKey: ['items', fid] });
     },
-    onError: (err) => push(err instanceof ApiError ? err.message : '采纳失败', 'error'),
+    onError: (err) => {
+      const reason = conflictReason(err);
+      if (reason === 'already_decided' || reason === 'already_in_story') {
+        push(err instanceof ApiError ? err.message : '这条补充的状态刚刚变了，请刷新后再看', 'error');
+      } else {
+        push(err instanceof ApiError ? err.message : '采纳失败', 'error');
+      }
+      void invalidate();
+    },
   });
 
   const reject = useMutation({
@@ -63,8 +99,6 @@ export function StoryThread({ fid, item }: { fid: string; item: ItemDetail }) {
     },
     onError: (err) => push(err instanceof ApiError ? err.message : '删除失败', 'error'),
   });
-
-  const visibleNotes = item.notes.filter((n) => n.status !== 'rejected');
 
   return (
     <section className="card">
@@ -90,17 +124,25 @@ export function StoryThread({ fid, item }: { fid: string; item: ItemDetail }) {
                   <span className="log-item__meta">{relativeTime(note.createdAt)}</span>
                 </div>
                 <p style={{ margin: '6px 0 0', whiteSpace: 'pre-wrap' }}>{note.body}</p>
+                {note.status === 'accepted' && (note.decider || note.versionNumber) ? (
+                  <p className="muted" style={{ fontSize: 12, margin: '6px 0 0' }}>
+                    {note.decider ? `${note.decider.displayName} 采纳` : '已采纳'}
+                    {note.versionNumber ? ` · 生成第 ${note.versionNumber} 版` : ''}
+                    {note.decidedAt ? ` · ${relativeTime(note.decidedAt)}` : ''}
+                  </p>
+                ) : null}
                 {item.permissions.canEdit && note.status === 'pending' ? (
                   <div className="row" style={{ gap: 'var(--space-2)', marginTop: 6 }}>
                     <Button size="sm" variant="primary" loading={accept.isPending} onClick={() => accept.mutate(note.id)}>
-                      采纳并并入正文
+                      采纳并生成版本
                     </Button>
                     <Button size="sm" onClick={() => reject.mutate(note.id)}>
                       驳回
                     </Button>
                   </div>
                 ) : null}
-                {note.author?.id === user?.id || item.permissions.canEdit ? (
+                {/* 已采纳的内容属于决策记录（已并入正文并生成版本），不允许删除 */}
+                {note.status !== 'accepted' && (note.author?.id === user?.id || item.permissions.canEdit) ? (
                   <Button
                     size="sm"
                     variant="ghost"
@@ -140,6 +182,18 @@ export function StoryThread({ fid, item }: { fid: string; item: ItemDetail }) {
             maxLength={5000}
             aria-label="补充内容"
           />
+          {localDup ? (
+            <p className="field__error" role="status">
+              {localDup.kind === 'exact'
+                ? '上面已经有几乎完全相同的补充，不用再提交一次'
+                : '这条与上面某条补充高度重合，确认是新内容再提交'}
+            </p>
+          ) : null}
+          {!localDup && inStory ? (
+            <p className="field__error" role="status">
+              这些内容看起来已经写在正文里了
+            </p>
+          ) : null}
           {error ? (
             <p className="field__error" role="alert">
               {error}
@@ -148,7 +202,7 @@ export function StoryThread({ fid, item }: { fid: string; item: ItemDetail }) {
           <Button
             variant="primary"
             loading={create.isPending}
-            disabled={!body.trim()}
+            disabled={!body.trim() || Boolean(localDup) || inStory}
             onClick={() => {
               setError(null);
               create.mutate();

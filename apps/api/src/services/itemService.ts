@@ -14,6 +14,38 @@ export interface ActorMeta {
   userAgent?: string | null;
 }
 
+export type Tx = Prisma.TransactionClient;
+
+/**
+ * 锁定条目行直到事务结束。所有「读正文 → 合并 → 写回」类流程必须先拿这把锁，
+ * 保证多位家人并发采纳/编辑时严格串行，后到的事务一定能看到前一个已提交的版本，
+ * 不会覆盖已经采纳进正文的内容。
+ */
+export async function lockItem(tx: Tx, itemId: string): Promise<void> {
+  await tx.$queryRaw`SELECT id FROM items WHERE id = ${itemId} FOR UPDATE`;
+}
+
+/** 写入下一个序号的版本；调用方必须已持有条目行锁。 */
+export async function createItemVersion(
+  tx: Tx,
+  item: Item,
+  createdBy: string,
+  source: 'create' | 'edit' | 'note' | 'revert' = 'edit',
+  noteId?: string,
+) {
+  const last = await tx.itemVersion.findFirst({ where: { itemId: item.id }, orderBy: { version: 'desc' } });
+  return tx.itemVersion.create({
+    data: {
+      itemId: item.id,
+      version: (last?.version ?? 0) + 1,
+      source,
+      noteId: noteId ?? null,
+      snapshot: toVersionSnapshot(item),
+      createdBy,
+    },
+  });
+}
+
 export interface ItemInput {
   title?: string;
   category?: Category;
@@ -124,7 +156,11 @@ export async function getItemDetail(userId: string, ctx: FamilyContext, itemId: 
       creator: { select: { id: true, displayName: true, avatarColor: true } },
       notes: {
         where: { status: { not: 'rejected' } },
-        include: { author: { select: { id: true, displayName: true, avatarColor: true } } },
+        include: {
+          author: { select: { id: true, displayName: true, avatarColor: true } },
+          decider: { select: { id: true, displayName: true, avatarColor: true } },
+          version: { select: { id: true, version: true } },
+        },
         orderBy: { createdAt: 'asc' },
       },
       shares: { include: { item: false } },
@@ -150,6 +186,12 @@ export async function getItemDetail(userId: string, ctx: FamilyContext, itemId: 
       rejectReason: n.rejectReason,
       createdAt: n.createdAt.toISOString(),
       decidedAt: n.decidedAt?.toISOString() ?? null,
+      decidedBy: n.decidedBy,
+      decider: n.decider
+        ? { id: n.decider.id, displayName: n.decider.displayName, avatarColor: n.decider.avatarColor }
+        : null,
+      versionId: n.versionId,
+      versionNumber: n.version?.version ?? null,
       author: n.author,
     })),
     sharedWith: sharedUsers.map((m) => ({
@@ -231,9 +273,7 @@ export async function createItem(userId: string, ctx: FamilyContext, input: Item
       include: LIST_INCLUDE,
     });
 
-    await tx.itemVersion.create({
-      data: { itemId: created.id, version: 1, snapshot: toVersionSnapshot(created), createdBy: userId },
-    });
+    await createItemVersion(tx, created, userId, 'create');
     await audit.record(
       {
         familyId: ctx.familyId,
@@ -298,6 +338,7 @@ export async function updateItem(
       : computeSortAt({ acquiredAt: nextAcquiredAt, acquiredPrecision: nextPrecision }, new Date());
 
   return prisma.$transaction(async (tx) => {
+    await lockItem(tx, itemId);
     const updated = await tx.item.update({
       where: { id: itemId },
       data: {
@@ -340,15 +381,7 @@ export async function updateItem(
       }
     }
 
-    const last = await tx.itemVersion.findFirst({ where: { itemId }, orderBy: { version: 'desc' } });
-    await tx.itemVersion.create({
-      data: {
-        itemId,
-        version: (last?.version ?? 0) + 1,
-        snapshot: toVersionSnapshot(updated),
-        createdBy: userId,
-      },
-    });
+    await createItemVersion(tx, updated, userId, 'edit');
     await audit.record(
       {
         familyId: ctx.familyId,
@@ -469,6 +502,8 @@ export async function listVersions(ctx: FamilyContext, itemId: string) {
   return versions.map((v) => ({
     id: v.id,
     version: v.version,
+    source: v.source,
+    noteId: v.noteId,
     createdAt: v.createdAt.toISOString(),
     createdBy: v.createdBy,
     snapshot: v.snapshot,
@@ -491,6 +526,7 @@ export async function revertVersion(
   const story = cleanStory(typeof snap.storyHtml === 'string' ? snap.storyHtml : null);
 
   return prisma.$transaction(async (tx) => {
+    await lockItem(tx, itemId);
     const updated = await tx.item.update({
       where: { id: itemId },
       data: {
@@ -520,15 +556,7 @@ export async function revertVersion(
       },
       include: LIST_INCLUDE,
     });
-    const last = await tx.itemVersion.findFirst({ where: { itemId }, orderBy: { version: 'desc' } });
-    await tx.itemVersion.create({
-      data: {
-        itemId,
-        version: (last?.version ?? 0) + 1,
-        snapshot: toVersionSnapshot(updated),
-        createdBy: userId,
-      },
-    });
+    await createItemVersion(tx, updated, userId, 'revert');
     await audit.record(
       {
         familyId: ctx.familyId,

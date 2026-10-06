@@ -103,13 +103,28 @@ export interface ItemDetail extends Item {
 
 export interface Note {
   id: string;
+  itemId?: string;
   type: 'story' | 'comment' | 'correction';
   body: string;
   status: 'pending' | 'accepted' | 'rejected';
   rejectReason: string | null;
   createdAt: string;
   decidedAt: string | null;
+  decidedBy: string | null;
+  decider: { id: string; displayName: string; avatarColor: string } | null;
+  versionId: string | null;
+  versionNumber: number | null;
   author: { id: string; displayName: string; avatarColor: string } | null;
+}
+
+export interface ItemVersion {
+  id: string;
+  version: number;
+  source: 'create' | 'edit' | 'note' | 'revert';
+  noteId: string | null;
+  createdAt: string;
+  createdBy: string;
+  snapshot: Record<string, unknown>;
 }
 
 export interface Person {

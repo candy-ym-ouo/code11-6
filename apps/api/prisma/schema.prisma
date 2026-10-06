@@ -84,6 +84,13 @@ enum NoteStatus {
   rejected
 }
 
+enum VersionSource {
+  create
+  edit
+  note
+  revert
+}
+
 enum PersonRole {
   source
   gifted
@@ -121,6 +128,7 @@ model User {
   memberships   FamilyMember[]
   items         Item[]
   notes         ItemNote[]
+  noteDecisions ItemNote[]    @relation("NoteDecisions")
   versions      ItemVersion[]
   auditLogs     AuditLog[]
   refreshTokens RefreshToken[]
@@ -303,16 +311,24 @@ model ItemNote {
   authorId     String     @map("author_id")
   type         NoteType   @default(story)
   body         String
+  bodyHash     String     @map("body_hash")
   status       NoteStatus @default(pending)
   rejectReason String?    @map("reject_reason")
   decidedBy    String?    @map("decided_by")
   decidedAt    DateTime?  @map("decided_at")
+  versionId    String?    @map("version_id")
   createdAt    DateTime   @default(now()) @map("created_at")
 
-  item   Item @relation(fields: [itemId], references: [id], onDelete: Cascade)
-  author User @relation(fields: [authorId], references: [id])
+  item    Item        @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  author  User        @relation(fields: [authorId], references: [id])
+  version ItemVersion? @relation("NoteAcceptedVersion", fields: [versionId], references: [id], onDelete: SetNull)
+  decider User?       @relation("NoteDecisions", fields: [decidedBy], references: [id], onDelete: SetNull)
 
   @@index([itemId, createdAt])
+  @@index([bodyHash])
+  // 部分唯一索引（同条目未驳回补充不得重复）由迁移 SQL 持有：
+  // CREATE UNIQUE INDEX item_notes_dup_partial ON item_notes(item_id, body_hash) WHERE status <> 'rejected';
+  // Prisma 5 不支持在 schema 中声明带 WHERE 的唯一索引。
   @@map("item_notes")
 }
 
@@ -331,17 +347,21 @@ model ItemShare {
 }
 
 model ItemVersion {
-  id        String   @id @default(cuid())
-  itemId    String   @map("item_id")
+  id        String        @id @default(cuid())
+  itemId    String        @map("item_id")
   version   Int
+  source    VersionSource @default(create)
+  noteId    String?       @map("note_id")
   snapshot  Json
-  createdBy String   @map("created_by")
-  createdAt DateTime @default(now()) @map("created_at")
+  createdBy String        @map("created_by")
+  createdAt DateTime      @default(now()) @map("created_at")
 
-  item    Item @relation(fields: [itemId], references: [id], onDelete: Cascade)
-  creator User @relation(fields: [createdBy], references: [id])
+  item    Item      @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  creator User      @relation(fields: [createdBy], references: [id])
+  acceptedNotes ItemNote[] @relation("NoteAcceptedVersion")
 
   @@unique([itemId, version])
+  @@index([noteId])
   @@map("item_versions")
 }
 

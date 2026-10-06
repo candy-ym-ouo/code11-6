@@ -166,8 +166,15 @@ itemsRouter.post(
   asyncHandler(async (req, res) => {
     const user = currentUser(req);
     const ctx = familyCtx(req);
-    const note = await noteService.acceptNote(user.id, ctx, req.params.itemId!, req.params.noteId!, clientMeta(req));
-    res.json({ note, item: await itemService.getItemDetail(user.id, ctx, req.params.itemId!) });
+    const { note, version } = await noteService.acceptNote(
+      user.id,
+      ctx,
+      req.params.itemId!,
+      req.params.noteId!,
+      clientMeta(req),
+    );
+    const item = await itemService.getItemDetail(user.id, ctx, req.params.itemId!);
+    res.json({ note, version, item });
   }),
 );
 
